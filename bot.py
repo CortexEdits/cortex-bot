@@ -1,22 +1,35 @@
 import asyncio
+import html
+import json
 import logging
 import os
+import time
+
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import (
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
     Message,
 )
 
-# Токен берется из переменных окружения (для Bothost), если нет — подставляется ваш
-TOKEN = os.getenv("BOT_TOKEN", "9287829274:AAFaGM4WwHNRlQm5Ukg36AojXtkgwEzMSzk")
+# ВАЖНО: токен только из переменных окружения (в коде его хранить нельзя).
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise SystemExit(
+        "Не задан BOT_TOKEN. Добавьте токен бота в переменные окружения хостинга."
+    )
+
 WORK_GROUP_ID = -1004300868991  # ID закрытой группы с темами
 DEV_IDS = [
     7492826311,
@@ -24,23 +37,235 @@ DEV_IDS = [
     7274526703,
 ]  # Твой ID, ID друга и ID третьего разработчика
 
-user_to_thread = {}
-thread_to_user = {}
-assigned_dev = {}
+# Сколько секунд тишины ждать, прежде чем отправить ПЕРВУЮ пачку материалов
+FIRST_BATCH_DELAY = 60.0
+# Сколько секунд ждать, собирая дополнительные файлы уже после создания заказа
+FOLLOWUP_DELAY = 5.0
+# Лимит Telegram на размер одного альбома
+ALBUM_SIZE = 10
+
+# Файл, где хранятся открытые заказы (чтобы они не терялись при перезапуске бота)
+STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
+
+STATUS_FREE = "🟢 Свободен, ждет исполнителя."
+
+user_to_thread = {}  # {user_id: thread_id}
+thread_to_user = {}  # {thread_id: user_id}
+assigned_dev = {}  # {thread_id: dev_id}
 
 # Словарь для хранения ID текущего интерактивного сообщения у клиента: {user_id: message_id}
 user_confirm_msg_id = {}
 
-# Буферы для сбора медиафайлов от пользователя
-order_buffers = {}
-buffer_tasks = {}
+# Клиенты, которые нажали «Оформить заказ» и сейчас присылают материалы: {user_id: тариф}
+pending_price = {}
 
-
-class OrderState(StatesGroup):
-  waiting_for_tz = State()  # Шаг: ожидание материалов и ТЗ
-
+# Когда клиенту в последний раз показывали подсказку (чтобы не спамить)
+last_hint = {}
 
 router = Router()
+
+
+# ===================== СОХРАНЕНИЕ СОСТОЯНИЯ =====================
+
+
+def save_state():
+  data = {
+      "user_to_thread": {str(k): v for k, v in user_to_thread.items()},
+      "assigned_dev": {str(k): v for k, v in assigned_dev.items()},
+  }
+  tmp_path = STATE_FILE + ".tmp"
+  try:
+    with open(tmp_path, "w", encoding="utf-8") as f:
+      json.dump(data, f)
+    os.replace(tmp_path, STATE_FILE)
+  except OSError:
+    logging.exception("Не удалось сохранить состояние в %s", STATE_FILE)
+
+
+def load_state():
+  try:
+    with open(STATE_FILE, encoding="utf-8") as f:
+      data = json.load(f)
+  except FileNotFoundError:
+    return
+  except Exception:
+    logging.exception("Не удалось прочитать %s", STATE_FILE)
+    return
+
+  for user_id, thread_id in data.get("user_to_thread", {}).items():
+    user_to_thread[int(user_id)] = int(thread_id)
+    thread_to_user[int(thread_id)] = int(user_id)
+  for thread_id, dev_id in data.get("assigned_dev", {}).items():
+    assigned_dev[int(thread_id)] = int(dev_id)
+  logging.info("Загружено открытых заказов: %d", len(user_to_thread))
+
+
+# ===================== ВСПОМОГАТЕЛЬНОЕ =====================
+
+
+async def tg_call(method, *args, **kwargs):
+  """Вызов Telegram API с повтором при flood control и сетевых сбоях."""
+  for attempt in range(1, 6):
+    try:
+      return await method(*args, **kwargs)
+    except TelegramRetryAfter as e:
+      logging.warning("Flood control, жду %s сек.", e.retry_after)
+      await asyncio.sleep(e.retry_after + 1)
+    except (TelegramNetworkError, TelegramServerError):
+      if attempt == 5:
+        raise
+      await asyncio.sleep(2 * attempt)
+  return await method(*args, **kwargs)
+
+
+class Batcher:
+  """Копит сообщения пользователя и отдаёт их одной пачкой после паузы.
+
+  Каждое новое сообщение сбрасывает таймер. Пачки одного пользователя
+  обрабатываются строго по очереди (через Lock), поэтому ничего не
+  перемешивается и не теряется.
+  """
+
+  def __init__(self, flush_cb):
+    self.flush_cb = flush_cb
+    self.buffers = {}
+    self.timers = {}
+    self.locks = {}
+
+  def busy(self, key) -> bool:
+    lock = self.locks.get(key)
+    return key in self.buffers or bool(lock and lock.locked())
+
+  def has_buffer(self, key) -> bool:
+    return key in self.buffers
+
+  def add(self, key, message, delay: float, bot):
+    self.buffers.setdefault(key, []).append(message)
+    old = self.timers.pop(key, None)
+    if old:
+      old.cancel()
+    self.timers[key] = asyncio.create_task(self._run(key, delay, bot))
+
+  def drop(self, key):
+    self.buffers.pop(key, None)
+    task = self.timers.pop(key, None)
+    if task:
+      task.cancel()
+
+  async def _run(self, key, delay: float, bot):
+    try:
+      await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+      return
+    # С этого момента таймер уже не отменяется новыми сообщениями —
+    # они попадут в новый буфер и уйдут следующей пачкой.
+    if self.timers.get(key) is asyncio.current_task():
+      self.timers.pop(key, None)
+
+    lock = self.locks.setdefault(key, asyncio.Lock())
+    async with lock:
+      messages = self.buffers.pop(key, [])
+      if not messages:
+        return
+      try:
+        await self.flush_cb(bot, key, messages)
+      except Exception:
+        logging.exception("Ошибка при отправке пачки (key=%s)", key)
+
+
+async def send_album(
+    bot: Bot, chat_id: int, thread_id, items: list
+):
+  """Отправляет альбом. Telegram не принимает альбом из 1 файла — шлём обычным сообщением."""
+  extra = {"message_thread_id": thread_id} if thread_id else {}
+
+  if len(items) == 1:
+    item = items[0]
+    if isinstance(item, InputMediaPhoto):
+      await tg_call(bot.send_photo, chat_id=chat_id, photo=item.media, **extra)
+    elif isinstance(item, InputMediaVideo):
+      await tg_call(bot.send_video, chat_id=chat_id, video=item.media, **extra)
+    else:
+      await tg_call(
+          bot.send_document, chat_id=chat_id, document=item.media, **extra
+      )
+    return
+
+  await tg_call(bot.send_media_group, chat_id=chat_id, media=items, **extra)
+
+
+async def send_batch(
+    bot: Bot,
+    chat_id: int,
+    messages: list,
+    thread_id=None,
+    captions_title: str = "",
+):
+  """Отправляет собранные сообщения: фото/видео — альбомами по 10, документы — отдельными
+  альбомами, всё остальное (текст, голосовые, кружки и т.д.) — копированием.
+  """
+  visual = []  # фото и видео (можно в одном альбоме)
+  docs = []  # файлы-документы (только в своём альбоме)
+  others = []  # текст, голосовые, стикеры и т.д.
+  captions = []  # подписи к медиа (в альбоме они бы потерялись)
+
+  for m in messages:
+    if m.photo:
+      visual.append(InputMediaPhoto(media=m.photo[-1].file_id))
+    elif m.video:
+      visual.append(InputMediaVideo(media=m.video.file_id))
+    elif m.document and not m.animation:
+      docs.append(InputMediaDocument(media=m.document.file_id))
+    else:
+      others.append(m)
+      continue
+    if m.caption:
+      captions.append(m.caption)
+
+  extra = {"message_thread_id": thread_id} if thread_id else {}
+  failed = 0
+
+  for group in (visual, docs):
+    for i in range(0, len(group), ALBUM_SIZE):
+      chunk = group[i : i + ALBUM_SIZE]
+      try:
+        await send_album(bot, chat_id, thread_id, chunk)
+      except Exception:
+        failed += len(chunk)
+        logging.exception("Не удалось отправить альбом из %d файлов", len(chunk))
+      await asyncio.sleep(0.5)
+
+  if captions:
+    text = "\n\n".join(captions)
+    if captions_title:
+      text = f"{captions_title}\n{text}"
+    try:
+      await tg_call(
+          bot.send_message, chat_id=chat_id, text=text[:4096], **extra
+      )
+    except Exception:
+      logging.exception("Не удалось отправить подписи к файлам")
+
+  for m in others:
+    try:
+      await tg_call(m.copy_to, chat_id=chat_id, **extra)
+    except Exception:
+      failed += 1
+      logging.exception("Не удалось скопировать сообщение %s", m.message_id)
+
+  if failed:
+    try:
+      await tg_call(
+          bot.send_message,
+          chat_id=chat_id,
+          text=f"⚠️ Не удалось доставить файлов: {failed}. Попросите клиента отправить их ещё раз.",
+          **extra,
+      )
+    except Exception:
+      logging.exception("Не удалось отправить предупреждение об ошибке")
+
+
+# ===================== КЛАВИАТУРЫ =====================
 
 
 # Клавиатура главного меню
@@ -129,8 +354,13 @@ def get_confirm_close_kb(thread_id: int):
 
 
 # Функция отправки главного меню (с баннером)
-async def show_main_menu(bot: Bot, chat_id: int, state: FSMContext):
-  await state.clear()
+async def show_main_menu(bot: Bot, chat_id: int):
+  # В личке chat_id совпадает с id пользователя.
+  # Если клиент ещё ничего не загрузил — отменяем ожидание материалов.
+  # Если файлы уже загружены, заказ всё равно будет создан.
+  if not batcher.busy(chat_id):
+    pending_price.pop(chat_id, None)
+
   caption_text = (
       "🖤 **CortexEdits** — делаем стильные и красивые эдиты для твоей"
       " техники.\n\nПодчеркнем каждую детальку твоего железа:\n🚲"
@@ -158,15 +388,15 @@ async def show_main_menu(bot: Bot, chat_id: int, state: FSMContext):
 
 # 1. Команда /start
 @router.message(Command("start"), F.chat.type == "private")
-async def cmd_start(message: Message, state: FSMContext, bot: Bot):
-  await show_main_menu(bot, message.chat.id, state)
+async def cmd_start(message: Message, bot: Bot):
+  await show_main_menu(bot, message.chat.id)
 
 
 # Возврат в главное меню
 @router.callback_query(F.data == "menu_home")
-async def cb_menu_home(callback: CallbackQuery, state: FSMContext, bot: Bot):
+async def cb_menu_home(callback: CallbackQuery, bot: Bot):
   await callback.answer()
-  await show_main_menu(bot, callback.message.chat.id, state)
+  await show_main_menu(bot, callback.message.chat.id)
   try:
     await callback.message.delete()
   except Exception:
@@ -175,7 +405,7 @@ async def cb_menu_home(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
 # 2. Меню выбора тарифов
 @router.callback_query(F.data == "menu_order")
-async def cb_menu_order(callback: CallbackQuery, state: FSMContext, bot: Bot):
+async def cb_menu_order(callback: CallbackQuery, bot: Bot):
   await callback.answer()
 
   caption_text = (
@@ -206,11 +436,10 @@ async def cb_menu_order(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
 # 3. Обработка конкретного тарифа (50, 100, 150 руб) с прикреплением видео-примера
 @router.callback_query(F.data.startswith("price_"))
-async def cb_select_price(callback: CallbackQuery, state: FSMContext, bot: Bot):
+async def cb_select_price(callback: CallbackQuery, bot: Bot):
   await callback.answer()
 
   price = callback.data.split("_")[1]
-  await state.update_data(selected_price=price)
 
   common_desc = (
       f"🖤 **Тариф: Эдит за {price} ₽**\n\n"
@@ -272,13 +501,10 @@ async def cb_select_price(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
 # 4. Нажатие «Оформить заказ» -> Запрос материалов пачкой
 @router.callback_query(F.data.startswith("confirm_price_"))
-async def cb_confirm_price(
-    callback: CallbackQuery, state: FSMContext, bot: Bot
-):
+async def cb_confirm_price(callback: CallbackQuery, bot: Bot):
   await callback.answer()
   price = callback.data.split("_")[2]
-  await state.set_state(OrderState.waiting_for_tz)
-  await state.update_data(selected_price=price)
+  pending_price[callback.from_user.id] = price
 
   tz_text = (
       f"🖤 **Оформление заказа ({price} ₽):**\n\n"
@@ -301,35 +527,30 @@ async def cb_confirm_price(
     pass
 
 
-# Функция финализации заказа и отправки собранных файлов альбомом внутрь топика
-async def finalize_order(user_id: int, bot: Bot, state: FSMContext):
-  messages = order_buffers.pop(user_id, [])
-  buffer_tasks.pop(user_id, None)
+# ===================== ЗАКАЗЫ =====================
 
-  if not messages:
-    return
 
-  data = await state.get_data()
-  price = data.get("selected_price", "100")
-  await state.clear()
+def build_order_text(user, price) -> str:
+  # HTML + html.escape: юзернеймы с «_» и другие символы больше не ломают сообщение
+  name = html.escape(user.full_name or "Без имени")
+  username = f"@{html.escape(user.username)}" if user.username else "без юзернейма"
+  return (
+      "🔥 <b>Новый заказ в общей очереди!</b>\n\n"
+      f"💰 <b>Тариф:</b> {html.escape(str(price))} ₽\n"
+      f'👤 <b>Клиент:</b> <a href="tg://user?id={user.id}">{name}</a>'
+      f" ({username})\n"
+      f"🆔 <code>{user.id}</code>\n"
+      f"📌 <b>Статус:</b> {STATUS_FREE}"
+  )
 
-  user = messages[0].from_user
+
+async def create_order(bot: Bot, user, price) -> int:
+  """Создаёт тему и сообщение с кнопкой «Взять заказ». Возвращает thread_id."""
   topic_name = f"[{price}₽] Заказ | {user.full_name}"
-
-  try:
-    forum_topic = await bot.create_forum_topic(
-        chat_id=WORK_GROUP_ID, name=topic_name[:120]
-    )
-    thread_id = forum_topic.message_thread_id
-  except Exception as e:
-    await bot.send_message(
-        user_id, "⚠️ Ошибка при создании заказа. Попробуйте позже."
-    )
-    print(f"Ошибка создания топика: {e}")
-    return
-
-  user_to_thread[user.id] = thread_id
-  thread_to_user[thread_id] = user.id
+  forum_topic = await tg_call(
+      bot.create_forum_topic, chat_id=WORK_GROUP_ID, name=topic_name[:120]
+  )
+  thread_id = forum_topic.message_thread_id
 
   pool_kb = InlineKeyboardMarkup(
       inline_keyboard=[
@@ -348,83 +569,110 @@ async def finalize_order(user_id: int, bot: Bot, state: FSMContext):
       ]
   )
 
-  username_str = f"@{user.username}" if user.username else "без юзернейма"
-  order_msg_text = (
-      "🔥 **Новый заказ в общей очереди!**\n\n"
-      f"💰 **Тариф:** {price} ₽\n"
-      f"👤 **Клиент:** {username_str} (ID: `{user.id}`)\n"
-      "📌 **Статус:** 🟢 Свободен, ждет исполнителя."
-  )
-
-  await bot.send_message(
-      chat_id=WORK_GROUP_ID,
-      message_thread_id=thread_id,
-      text=order_msg_text,
-      reply_markup=pool_kb,
-      parse_mode="Markdown",
-  )
-
-  media_group = []
-  text_messages = []
-
-  for msg in messages:
-    if msg.photo:
-      media_group.append(InputMediaPhoto(media=msg.photo[-1].file_id))
-    elif msg.video:
-      media_group.append(InputMediaVideo(media=msg.video.file_id))
-    else:
-      text_messages.append(msg)
-
-  if media_group:
-    for i in range(0, len(media_group), 10):
-      chunk = media_group[i : i + 10]
-      try:
-        await bot.send_media_group(
-            chat_id=WORK_GROUP_ID, message_thread_id=thread_id, media=chunk
-        )
-        await asyncio.sleep(0.6)
-      except Exception as e:
-        print(f"Ошибка отправки медиагруппы: {e}")
-
-  for msg in text_messages:
+  try:
+    await tg_call(
+        bot.send_message,
+        chat_id=WORK_GROUP_ID,
+        message_thread_id=thread_id,
+        text=build_order_text(user, price),
+        reply_markup=pool_kb,
+        parse_mode="HTML",
+    )
+  except Exception:
+    # Не оставляем пустую тему без кнопки — удаляем и сообщаем об ошибке выше
     try:
-      await msg.copy_to(chat_id=WORK_GROUP_ID, message_thread_id=thread_id)
-    except Exception as e:
-      print(f"Ошибка копирования текста/файла: {e}")
+      await bot.delete_forum_topic(
+          chat_id=WORK_GROUP_ID, message_thread_id=thread_id
+      )
+    except Exception:
+      pass
+    raise
 
-  sent_msg = await bot.send_message(
-      user_id,
-      "✅ **Ваше ТЗ и материалы успешно ушли команде"
-      " разработчиков!**\nОжидайте, скоро кто-то возьмет заказ в работу."
-      " Можете писать сюда любые вопросы.",
-      reply_markup=get_client_order_kb(thread_id),
-      parse_mode="Markdown",
+  user_to_thread[user.id] = thread_id
+  thread_to_user[thread_id] = user.id
+  save_state()
+  return thread_id
+
+
+async def flush_client_batch(bot: Bot, user_id: int, messages: list):
+  """Отправляет собранную пачку от клиента в тему заказа (создавая её при необходимости)."""
+  thread_id = user_to_thread.get(user_id)
+  is_new = thread_id is None
+
+  if is_new:
+    price = pending_price.get(user_id, "100")
+    try:
+      thread_id = await create_order(bot, messages[0].from_user, price)
+    except Exception:
+      logging.exception("Ошибка создания заказа для %s", user_id)
+      await bot.send_message(
+          user_id,
+          "⚠️ Ошибка при создании заказа. Отправьте материалы ещё раз чуть"
+          " позже.",
+      )
+      return
+    pending_price.pop(user_id, None)
+
+  await send_batch(
+      bot,
+      WORK_GROUP_ID,
+      messages,
+      thread_id=thread_id,
+      captions_title="💬 Комментарий клиента:",
   )
-  user_confirm_msg_id[user_id] = sent_msg.message_id
+
+  if is_new:
+    sent_msg = await bot.send_message(
+        user_id,
+        "✅ **Ваше ТЗ и материалы успешно ушли команде"
+        " разработчиков!**\nОжидайте, скоро кто-то возьмет заказ в работу."
+        " Можете писать сюда любые вопросы.",
+        reply_markup=get_client_order_kb(thread_id),
+        parse_mode="Markdown",
+    )
+    user_confirm_msg_id[user_id] = sent_msg.message_id
+  else:
+    await bot.send_message(user_id, "✅ Файлы переданы команде.")
 
 
-# 5. Сбор ТЗ пачкой с ожиданием 1 минуты (60 секунд)
-@router.message(OrderState.waiting_for_tz, F.chat.type == "private")
-async def process_tz(message: Message, state: FSMContext, bot: Bot):
+batcher = Batcher(flush_client_batch)
+
+
+# 5. Все сообщения клиента в личке: сбор материалов и переписка по заказу
+@router.message(F.chat.type == "private")
+async def client_message(message: Message, bot: Bot):
   user_id = message.from_user.id
+  thread_id = user_to_thread.get(user_id)
 
-  if user_id in user_to_thread:
-    thread_id = user_to_thread[user_id]
-    await message.copy_to(chat_id=WORK_GROUP_ID, message_thread_id=thread_id)
+  # Нет ни активного заказа, ни ожидания материалов (например, после перезапуска бота)
+  if thread_id is None and user_id not in pending_price:
+    now = time.monotonic()
+    if now - last_hint.get(user_id, 0) > 30:
+      last_hint[user_id] = now
+      await message.answer(
+          "Не вижу активного заказа 🤔\nНажмите «Главное меню» → «Заказать"
+          " эдит», чтобы оформить заказ.",
+          reply_markup=get_back_to_menu_kb(),
+      )
     return
 
-  if user_id not in order_buffers:
-    order_buffers[user_id] = []
-  order_buffers[user_id].append(message)
+  # Первая пачка: ждём, пока клиент закончит загрузку
+  if thread_id is None:
+    batcher.add(user_id, message, FIRST_BATCH_DELAY, bot)
+    return
 
-  if user_id in buffer_tasks:
-    buffer_tasks[user_id].cancel()
+  # Заказ уже создан. Обычный текст пересылаем сразу, файлы собираем в альбомы.
+  is_file = bool(message.photo or message.video or message.document)
+  if not is_file and not batcher.busy(user_id):
+    try:
+      await tg_call(
+          message.copy_to, chat_id=WORK_GROUP_ID, message_thread_id=thread_id
+      )
+    except Exception:
+      logging.exception("Не удалось переслать сообщение клиента %s", user_id)
+    return
 
-  async def delayed_finalize():
-    await asyncio.sleep(60.0)
-    await finalize_order(user_id, bot, state)
-
-  buffer_tasks[user_id] = asyncio.create_task(delayed_finalize())
+  batcher.add(user_id, message, FOLLOWUP_DELAY, bot)
 
 
 # 6. Кнопка «Взять заказ» разработчиком
@@ -446,6 +694,7 @@ async def take_order_from_pool(callback: CallbackQuery, bot: Bot):
     return
 
   assigned_dev[thread_id] = dev_id
+  save_state()
 
   close_only_kb = InlineKeyboardMarkup(
       inline_keyboard=[[
@@ -456,16 +705,21 @@ async def take_order_from_pool(callback: CallbackQuery, bot: Bot):
       ]]
   )
 
+  taker = html.escape(callback.from_user.full_name or str(dev_id))
   try:
-    updated_text = callback.message.text.replace(
-        "📌 **Статус:** 🟢 Свободен, ждет исполнителя.",
-        "📌 **Статус:** 🔴 **ЗАНЯТ** (В работе)",
+    updated_text = callback.message.html_text.replace(
+        STATUS_FREE, f"🔴 <b>ЗАНЯТ</b> (в работе: {taker})"
     )
     await callback.message.edit_text(
-        updated_text, reply_markup=close_only_kb, parse_mode="Markdown"
+        updated_text, reply_markup=close_only_kb, parse_mode="HTML"
     )
-  except Exception as e:
-    print(f"Ошибка обновления статуса заказа: {e}")
+  except Exception:
+    logging.exception("Ошибка обновления статуса заказа")
+    # Хотя бы уберём кнопку «Взять заказ»
+    try:
+      await callback.message.edit_reply_markup(reply_markup=close_only_kb)
+    except Exception:
+      pass
 
   user_id = thread_to_user.get(thread_id)
   if user_id:
@@ -567,8 +821,11 @@ async def confirm_close_order(callback: CallbackQuery, bot: Bot):
   if user_id:
     user_to_thread.pop(user_id, None)
     user_confirm_msg_id.pop(user_id, None)
+    pending_price.pop(user_id, None)
+    batcher.drop(user_id)
   thread_to_user.pop(thread_id, None)
   assigned_dev.pop(thread_id, None)
+  save_state()
 
   if is_closed_by_admin:
     # Закрыли админы в рабочей группе -> отправляем сообщение клиенту
@@ -609,20 +866,10 @@ async def confirm_close_order(callback: CallbackQuery, bot: Bot):
 # ===============================================
 
 
-# 7. Пересылка сообщений от клиента в топик
-@router.message(F.chat.type == "private")
-async def client_to_dev_chat(message: Message, bot: Bot):
-  user_id = message.from_user.id
-  thread_id = user_to_thread.get(user_id)
-  if not thread_id:
-    return
-  await message.copy_to(chat_id=WORK_GROUP_ID, message_thread_id=thread_id)
-
-
 # 8. Пересылка от разработчика клиенту
 @router.message(F.chat.id == WORK_GROUP_ID, F.message_thread_id)
 async def dev_to_client_chat(message: Message, bot: Bot):
-  if message.from_user.is_bot:
+  if message.from_user is None or message.from_user.is_bot:
     return
 
   thread_id = message.message_thread_id
@@ -642,12 +889,16 @@ async def dev_to_client_chat(message: Message, bot: Bot):
     await message.reply("⚠️ Сначала нажмите «Взять заказ в работу».")
     return
 
-  await message.copy_to(user_id)
+  try:
+    await tg_call(message.copy_to, user_id)
+  except Exception:
+    logging.exception("Не удалось отправить сообщение клиенту %s", user_id)
+    await message.reply("⚠️ Не удалось доставить сообщение клиенту.")
 
 
 # 10. Поддержка
 @router.callback_query(F.data == "menu_profile")
-async def cb_menu_profile(callback: CallbackQuery, state: FSMContext, bot: Bot):
+async def cb_menu_profile(callback: CallbackQuery, bot: Bot):
   await callback.answer()
   text = (
       "🛠 **Поддержка**\n\nОбращайтесь по идеям, вопросам и сообщайте нам об"
@@ -664,6 +915,7 @@ async def cb_menu_profile(callback: CallbackQuery, state: FSMContext, bot: Bot):
 
 
 async def main():
+  load_state()
   bot = Bot(token=TOKEN)
   dp = Dispatcher()
   dp.include_router(router)
