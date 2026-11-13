@@ -392,11 +392,42 @@ async def cmd_start(message: Message, bot: Bot):
   await show_main_menu(bot, message.chat.id)
 
 
+def is_order_message(message) -> bool:
+  """Сообщение о заказе у клиента («ТЗ отправлено», «заказ взят в работу») —
+  у него есть кнопка закрытия заказа."""
+  markup = getattr(message, "reply_markup", None)
+  if not markup:
+    return False
+  return any(
+      (button.callback_data or "").startswith("ask_close_")
+      for row in markup.inline_keyboard
+      for button in row
+  )
+
+
 # Возврат в главное меню
 @router.callback_query(F.data == "menu_home")
 async def cb_menu_home(callback: CallbackQuery, bot: Bot):
   await callback.answer()
   await show_main_menu(bot, callback.message.chat.id)
+
+  if is_order_message(callback.message):
+    # Сообщение о заказе НЕ удаляем. Убираем из него только кнопку
+    # «Главное меню», чтобы повторными нажатиями не плодить новые меню.
+    # Кнопка «Закрыть и отменить заказ» остаётся.
+    rows = [
+        [b for b in row if b.callback_data != "menu_home"]
+        for row in callback.message.reply_markup.inline_keyboard
+    ]
+    rows = [row for row in rows if row]
+    try:
+      await callback.message.edit_reply_markup(
+          reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+      )
+    except Exception:
+      pass
+    return
+
   try:
     await callback.message.delete()
   except Exception:
