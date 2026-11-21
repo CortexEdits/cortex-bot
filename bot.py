@@ -86,7 +86,6 @@ STEP_NAMES = {
     4: "Оплата получена",
     5: "Заказ выдан",
 }
-LINE = "▬▬▬▬▬▬▬▬▬▬▬▬"
 
 VIDEO_FILES = {
     "50": "videos/example_50.mp4",
@@ -431,7 +430,7 @@ async def get_dev_name(bot: Bot, dev_id: int) -> str:
 def main_menu_text(user_id: int) -> str:
     text = (
         "🖤 <b>CORTEX EDITS</b>\n"
-        f"{LINE}\n\n"
+        "\n"
         "Делаем стильные эдиты для твоей техники:\n"
         "🚲 Велосипеды, BMX и МТБ\n"
         "🛴 Самокаты\n"
@@ -444,7 +443,7 @@ def main_menu_text(user_id: int) -> str:
     if order_no:
         order = orders[order_no]
         text += (
-            f"\n\n{LINE}\n"
+            f"\n\n"
             f"📦 <b>Активный заказ №{order['no']}</b>\n"
             f"{progress_bar(order['stage'])} шаг {order['stage']} из"
             f" {TOTAL_STEPS} · {STEP_NAMES[order['stage']]}"
@@ -469,9 +468,9 @@ def main_menu_kb(user_id: int):
 
 def prices_kb():
     return kb([
-        [btn("⚡ Эдит за 50 ₽", "price_50")],
-        [btn("🔥 Эдит за 100 ₽", "price_100")],
-        [btn("💎 Эдит за 150 ₽", "price_150")],
+        [btn("🖤 Эдит за 50 ₽", "price_50", style="success")],
+        [btn("🖤 Эдит за 100 ₽", "price_100", style="success")],
+        [btn("🖤 Эдит за 150 ₽", "price_150", style="success")],
         [btn("🏠 Главное меню", "menu_home")],
     ])
 
@@ -517,7 +516,7 @@ def build_client_text(order) -> str:
     return (
         f"{progress_bar(stage)}  <b>Шаг {stage} из {TOTAL_STEPS}</b> ·"
         f" {STEP_NAMES[stage]}\n"
-        f"{LINE}\n\n"
+        "\n"
         f"<b>Заказ №{order['no']}</b> · {esc(str(order['price']))} ₽\n\n"
         f"{descriptions[stage]}"
     )
@@ -541,7 +540,7 @@ def client_status_kb(order):
 
 
 def orders_screen(user_id: int):
-    lines = [f"📦 <b>Мои заказы</b>\n{LINE}\n"]
+    lines = [f"📦 <b>Мои заказы</b>\n"]
     active_order = orders.get(user_active.get(user_id))
     rows = []
 
@@ -669,7 +668,7 @@ async def cb_menu_private(callback: CallbackQuery):
 async def cb_menu_profile(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     text = (
-        f"🛠 <b>Поддержка</b>\n{LINE}\n\n"
+        f"🛠 <b>Поддержка</b>\n\n"
         "Обращайтесь по идеям, вопросам и сообщайте нам об ошибках:"
         f" {esc(SUPPORT_USERNAME)}"
     )
@@ -715,7 +714,7 @@ async def cb_menu_order(callback: CallbackQuery, bot: Bot):
         return
 
     caption = (
-        f"💰 <b>Выбери ценовую категорию эдита</b>\n{LINE}\n\nНажми на нужный"
+        f"💰 <b>Выбери ценовую категорию эдита</b>\n\nНажми на нужный"
         " вариант ниже 👇"
     )
     try:
@@ -750,7 +749,7 @@ async def cb_select_price(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     price = callback.data.split("_")[1]
     text = (
-        f"🎬 <b>Эдит за {esc(price)} ₽</b>\n{LINE}\n\n"
+        f"🎬 <b>Эдит за {esc(price)} ₽</b>\n\n"
         "<blockquote>1. Скидываешь исходники\n"
         "2. Мы делаем эдит и показываем превью\n"
         "3. Оплачиваешь — и получаешь готовый файл</blockquote>\n\n"
@@ -768,7 +767,7 @@ async def cb_how_to_shoot(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     price = callback.data.split("_")[1]
     caption = (
-        f"🎥 <b>Как правильно снимать · {esc(price)} ₽</b>\n{LINE}\n\n"
+        f"🎥 <b>Как правильно снимать · {esc(price)} ₽</b>\n\n"
         "⬛ Пример выше 👆\n\n"
         "<b>Требования к материалам:</b>\n"
         "▪️ Ракурсы как на примере\n"
@@ -817,7 +816,7 @@ async def cb_start_upload(callback: CallbackQuery, bot: Bot):
         drafts[user_id] = {"price": price, "messages": [], "summary_id": None}
 
     text = (
-        f"📥 <b>Скидывай исходники</b>\n{LINE}\n\n"
+        f"📥 <b>Скидывай исходники</b>\n\n"
         "Присылай видео, фото и музыку. Пожелания к монтажу напиши"
         " сообщением вместе с исходниками.\n"
         "Когда всё отправишь — нажми «✅ Готово», проверь сводку и подтверди"
@@ -903,7 +902,7 @@ async def draft_done(message: Message, bot: Bot):
             pass
 
     text = (
-        f"🔎 <b>Проверь заявку перед отправкой</b>\n{LINE}\n\n"
+        f"🔎 <b>Проверь заявку перед отправкой</b>\n\n"
         f"🎞 Видео, фото и файлов: <b>{media_count}</b>\n"
         f"💬 Текстовых сообщений: <b>{text_count}</b>\n"
         f"💰 Тариф: <b>{esc(str(draft['price']))} ₽</b>\n\n"
@@ -933,7 +932,7 @@ async def draft_cancel(message: Message, bot: Bot):
     await remove_reply_kb(bot, user_id)
     await bot.send_message(
         user_id,
-        f"✖ <b>Заявка отменена</b>\n{LINE}\n\nНичего не отправлено. Можно"
+        f"✖ <b>Заявка отменена</b>\n\nНичего не отправлено. Можно"
         " вернуться в меню или выбрать тариф заново.",
         reply_markup=kb([
             [btn("🎬 Выбрать тариф", "menu_order", style="primary")],
@@ -1369,6 +1368,9 @@ async def c_paid(callback: CallbackQuery, bot: Bot):
                 f" {who}, проверь поступление и нажми «💰 Оплата получена»."
             ),
             parse_mode="HTML",
+            reply_markup=kb([
+                [btn("💰 Оплата получена", f"d_paid_{order['no']}", style="success")]
+            ]),
         )
     except Exception:
         logging.exception("Не удалось отправить уведомление об оплате")
@@ -1621,6 +1623,11 @@ async def d_paid(callback: CallbackQuery, bot: Bot):
     order["updated"] = now_ts()
     save_state()
     await callback.answer("Оплата отмечена ✅")
+    if callback.message and callback.message.message_id != order.get("topic_msg_id"):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
     await refresh_topic_card(bot, order)
     await safe_push_client_status(bot, order)
 
